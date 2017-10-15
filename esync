@@ -1,0 +1,281 @@
+#!/bin/sh
+
+function doMetaRepoAction() {
+	ACTION=$1
+	REPO=$2
+	BRANCH=$3
+	GAWK_SCRIPT=$( egrep -m 1 -B 0 -A 999999 "^### GAWK_START ###$" "$0" )
+	git submodule foreach 'git branch ; echo ""' \
+	| gawk -v ACTION=$ACTION -v ACTION_REPO=$REPO -v ACTION_BRANCH=$BRANCH -- "$GAWK_SCRIPT" -
+}
+
+# sync from repos
+function doSync() {
+	cd /var/git/meta-repo/
+	git pull
+	git submodule update
+	doMetaRepoAction update
+	#cd /var/git/meta-repo/kits/xorg-kit/
+	#git checkout master
+	#git pull
+	cd /
+	chown -R portage:portage /var/git/meta-repo
+}
+
+# set a repo branch
+function doSet() {
+	REPO=$1
+	BRANCH=$2
+	cd /var/git/meta-repo/
+	doMetaRepoAction set $REPO $BRANCH
+}
+
+# show repo status
+function show() {
+	cd /var/git/meta-repo/
+	doMetaRepoAction show $1
+}
+
+# usage help
+function usage() {
+	echo "usage: $(basename $0) [help|sync|show [meta-repo]|set {meta-repo} {branch}]" >&2
+	echo "   sync  Syncs all meta-repos on the appropriate branches" >&2
+	echo "   show  Shows branches for meta-repo (all meta-repos by default)" >&2
+	echo "         Legend:  \"[checked-out]\", \"{selected}\", or \"available\"" >&2
+	echo "   set   Selects the desired branch for the specified meta-repo" >&2
+	echo "   help  Shows this help/usage text" >&2
+	exit 1
+}
+
+case "$1" in
+	show) show $2 ;;
+	set)  doSet $2 $3 ;;
+	sync) doSync ;;
+	*)    usage ;;
+esac
+
+exit 0
+
+### GAWK_START ###
+@load "filefuncs"
+
+function abort(EXITCODE) {
+	IS_ABORTED = 1
+	ABORT_CODE = EXITCODE
+	exit EXITCODE
+}
+
+function testSelectionFile(DO_ABORT,     N,ERR,FSTAT) {
+	N = stat(SELECTION_FILE, FSTAT)
+	ERR = ERRNO  # ERRNO is a string
+	if (N < 0) {
+		if (ERR == "No such file or directory" && DO_ABORT == "") {
+			print "" > SELECTION_FILE
+			close(SELECTION_FILE)
+			testSelectionFile("TRUE")
+		} else {
+			printf("E: %s N=%i %s\n", SELECTION_FILE, N, ERR)
+			abort(1)
+		}
+	} else if (FSTAT["type"] != "file") {
+		print "E: Unexpected type: " FSTAT["type"]
+		abort(1)
+	}
+}
+
+BEGIN {
+	if (!("api_major" in PROCINFO)) {
+		printf("FATAL: This version of gawk does not support extension API.\n")
+		abort(1)
+	}
+	SELECTION_FILE="/var/git/.metarepo_selections"
+	testSelectionFile()
+	CURRENT_REPO=""
+	CURRENT_BRANCH=""
+	BRANCHES["REPO_COUNT"] = 0
+}
+
+/^Entering / {
+	if (match($0, /^Entering 'kits\/(.*)'$/, m)) {
+		CURRENT_REPO = m[1]
+		I = 0 + BRANCHES["REPO_COUNT"]
+		++BRANCHES["REPO_COUNT"]
+		BRANCHES[I] = CURRENT_REPO
+		BRANCHES[CURRENT_REPO]["BRANCH_COUNT"] = 0
+	} else {
+		print "FAIL"
+		exit 1
+	}
+	next
+}
+
+/^(\*| ) [^ ]/ {
+	if (match($0, /^(\*| ) (\(HEAD detached at (.*)\)|.*)$/, m)) {
+		I = 0 + BRANCHES[CURRENT_REPO]["BRANCH_COUNT"]
+		++BRANCHES[CURRENT_REPO]["BRANCH_COUNT"]
+		if (m[3] != "") {
+			#DETACHED HEAD with hash in m[3]
+			BRANCH = "HEAD"
+			BRANCHES[CURRENT_REPO]["HEAD"] = m[3]
+		} else {
+			BRANCH = m[2]
+		}
+		BRANCHES[CURRENT_REPO][I] = BRANCH
+		if (m[1] == "*") {
+			CURRENT_BRANCH = BRANCH
+			BRANCHES[CURRENT_REPO]["CURRENT"] = CURRENT_BRANCH
+		}
+	} else {
+		print "FAIL"
+		exit 1
+	}
+	next
+}
+
+/^$/ {
+	next
+}
+
+{
+	print "UNHANDLED LINE: " $0
+}
+
+function show(     RID,REPO,LINE,SELECTED,BC,BID,BRANCH ) {
+	RID = 0
+	while (RID < BRANCHES["REPO_COUNT"]) {
+		REPO = BRANCHES[RID]
+		LINE = sprintf("%-15s", REPO)
+		SELECTED = ""
+		BC = BRANCHES[REPO]["BRANCH_COUNT"]
+		BID = 0
+		while (BID < BC) {
+			BRANCH = BRANCHES[REPO][BID]
+			if (BRANCH == BRANCHES[REPO]["CURRENT"]) {
+				if (BRANCH == "HEAD") {
+					BRANCH = BRANCHES[REPO]["HEAD"]
+				}
+				LINE = LINE " [" BRANCH "]"
+			} else {
+				if (SELECTED == "") {
+					SELECTED = getSelectedBranch(REPO)
+				}
+				if (BRANCH == SELECTED) {
+					LINE = LINE " {" BRANCH "}"
+				} else {
+					LINE = LINE " " BRANCH
+				}
+			}
+			++BID
+		}
+		if (ACTION_REPO == "" || ACTION_REPO == REPO) {
+			print LINE
+		}
+		++RID
+	}
+}
+
+function getSelectedBranch(REPO,     LINE, SELECTION) {
+	while((getline LINE < SELECTION_FILE) > 0) {
+		if (match(LINE, /^(#.*|\s*)$/, m)) {
+			# comments and blank lines, we can ignore
+		} else if (match(LINE, /^([^:]*):(.*)$/, m)) {
+			if (m[1] == REPO) {
+				SELECTION = m[2]
+				close(SELECTION_FILE)
+				return SELECTION
+			}
+		} else {
+			print "failed to parse repo selections file line: " LINE
+			abort(1)
+		}
+	}
+	close(SELECTION_FILE)
+	return ""
+}
+
+function setSelectedBranch(REPO,BRANCH,     TMPFILE,LINE,OLDFILE,DID_WRITE) {
+	TMPFILE = SELECTION_FILE ".tmp"
+	printf "" > TMPFILE
+	DID_WRITE = 0
+	while((getline LINE < SELECTION_FILE) > 0) {
+		if (match(LINE, /^(#.*|\s*)$/, m)) {
+			# comments and blank lines, we copy over, but otherwise ignore
+			print LINE >> TMPFILE
+		} else if (match(LINE, /^([^:]*):(.*)$/, m)) {
+			if (m[1] == REPO) {
+				print REPO ":" BRANCH >> TMPFILE
+				DID_WRITE = 1
+			} else {
+				print LINE >> TMPFILE
+			}
+		} else {
+			print "failed to parse repo selections file line: " LINE
+			abort(1)
+		}
+	}
+	if (DID_WRITE == 0) {
+		print REPO ":" BRANCH >> TMPFILE
+	}
+	close(SELECTION_FILE)
+	close(TMPFILE)
+	OLDFILE = SELECTION_FILE ".old"
+	return system("cp " SELECTION_FILE " " OLDFILE " && mv " TMPFILE " " SELECTION_FILE)
+}
+
+function update(     RID,REPO,SELECTED,HAS_SELECTED,OPTIONS,BC,BID,BRANCH,DO_GIT_PULL) {
+	RID = 0
+	while (RID < BRANCHES["REPO_COUNT"]) {
+		REPO = BRANCHES[RID]
+		SELECTED = getSelectedBranch(REPO)
+		HAS_SELECTED = 0
+		OPTIONS = ""
+		BC = BRANCHES[REPO]["BRANCH_COUNT"]
+		BID = 0
+		while (BID < BC) {
+			BRANCH = BRANCHES[REPO][BID]
+			if (BRANCH == SELECTED) {
+				HAS_SELECTED = 1
+			}
+			OPTIONS = OPTIONS " " BRANCH
+			++BID
+		}
+		DO_GIT_PULL = 0
+		if (HAS_SELECTED == 0) {
+			print "W: meta-repo '" REPO "' does not contain selected branch '" SELECTED "' in (" OPTIONS ")"
+		} else if (SELECTED == "HEAD") {
+			print "W: unable to update meta-repo '" REPO "' because it is using a detached HEAD"
+		} else if (SELECTED == BRANCHES[REPO]["CURRENT"]) {
+			print "I: meta-repo '" REPO "' is already on branch '" SELECTED "'"
+			DO_GIT_PULL = 1
+		} else if (system("cd /var/git/meta-repo/kits/" REPO "/ && git checkout " SELECTED) != 0) {
+			print "W: meta-repo '" REPO "' failed to check out branch '" SELECTED "'"
+		} else {
+			print "I: meta-repo '" REPO "' is now on branch '" SELECTED "'"
+			DO_GIT_PULL = 1
+		}
+		if (DO_GIT_PULL == 1) {
+			if (system("cd /var/git/meta-repo/kits/" REPO "/ && git pull ") != 0) {
+				print "W: meta-repo '" REPO "' failed to update branch '" SELECTED "'"
+			} else {
+				print "I: meta-repo '" REPO "' successfully updated branch '" SELECTED "'"
+			}
+		} else {
+			print "I: skipping git-pull for meta-repo '" REPO "'"
+		}
+		++RID
+	}
+}
+
+END {
+	if (IS_ABORTED == 1) {
+		exit ABORT_CODE
+	} else if (ACTION == "update") {
+		update()
+	} else if (ACTION == "set") {
+		setSelectedBranch(ACTION_REPO, ACTION_BRANCH)
+	} else {
+		show()
+	}
+}
+
+
